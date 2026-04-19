@@ -1,0 +1,134 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "develop"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install lint dependencies
+        run: pip install ruff
+
+      - name: Run ruff check
+        run: ruff check alerts/ scripts/ airflow/dags/ tests/
+
+      - name: Run ruff format check
+        run: ruff format --check alerts/ scripts/ airflow/dags/ tests/
+
+  test:
+    name: Test (pytest)
+    runs-on: ubuntu-22.04
+    needs: lint
+    env:
+      # Dummy values — no real DB or Slack needed for unit tests
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: ecommerce
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      SLACK_WEBHOOK_URL: https://hooks.slack.com/services/FAKE/FAKE/FAKE
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install \
+            requests \
+            loguru \
+            responses \
+            pyyaml \
+            pytest \
+            pytest-cov \
+            pytest-mock \
+            apache-airflow==2.8.4 \
+            --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-2.8.4/constraints-3.11.txt"
+
+      - name: Run pytest
+        run: |
+          # Run from project root so conftest.py is picked up.
+          # conftest.py appends ROOT to sys.path AFTER site-packages,
+          # ensuring the real apache-airflow package wins over local airflow/ dir.
+          pytest tests/ -v \
+            --cov=alerts \
+            --cov=scripts \
+            --cov-report=xml:coverage.xml \
+            --cov-report=term-missing
+
+      - name: Upload coverage report
+        uses: codecov/codecov-action@v4
+        with:
+          files: coverage.xml
+          fail_ci_if_error: false
+
+  dag-integrity:
+    name: Airflow DAG integrity check
+    runs-on: ubuntu-22.04
+    needs: lint
+    env:
+      AIRFLOW__CORE__DAGS_FOLDER: airflow/dags
+      AIRFLOW__CORE__UNIT_TEST_MODE: "True"
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: "sqlite:////tmp/airflow.db"
+      SLACK_WEBHOOK_URL: https://hooks.slack.com/services/FAKE/FAKE/FAKE
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: ecommerce
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install Airflow
+        run: |
+          pip install --upgrade pip
+          pip install \
+            apache-airflow==2.8.4 \
+            loguru \
+            requests \
+            --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-2.8.4/constraints-3.11.txt"
+
+      - name: Airflow DB init
+        run: airflow db init
+
+      - name: Check DAG loading
+        run: |
+          # PYTHONPATH includes airflow/dags (for checkpoint_runner) but NOT the
+          # project root, so that the local airflow/ directory does not shadow
+          # the real apache-airflow package installed in site-packages.
+          export PYTHONPATH=$PWD/airflow/dags:$PWD/alerts
+          python -c "
+          import importlib, sys, pathlib
+          dag_dir = pathlib.Path('airflow/dags')
+          for dag_file in sorted(dag_dir.glob('*.py')):
+              if dag_file.name.startswith('__'):
+                  continue
+              spec = importlib.util.spec_from_file_location(dag_file.stem, dag_file)
+              mod = importlib.util.module_from_spec(spec)
+              spec.loader.exec_module(mod)
+              print(f'✅  {dag_file.name} loaded OK')
+          "

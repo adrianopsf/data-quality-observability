@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "data-quality-observability"
+version = "1.0.0"
+description = "Data quality observability layer for the Olist ecommerce stack"
+requires-python = ">=3.11"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501", "SIM102"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["alerts", "scripts"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Coverage is opt-in via make test-ci or explicit --cov flag.
+# Running without --cov avoids filesystem permission issues in sandboxed envs.
+addopts = "-v -p no:cacheprovider"
+tmp_path_retention_policy = "none"

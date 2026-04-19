@@ -1,0 +1,198 @@
+---
+# data-quality-observability — Docker Compose stack
+# Services: PostgreSQL 15, Airflow (webserver + scheduler), Grafana, Prometheus
+#
+# Prerequisites:
+#   cp .env.example .env  # fill in your values
+#   make up
+
+x-airflow-common: &airflow-common
+  image: apache/airflow:2.8.4-python3.11
+  env_file: .env
+  environment:
+    &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/airflow
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY}
+    AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW__WEBSERVER__SECRET_KEY}
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+    AIRFLOW__METRICS__STATSD_ON: "true"
+    AIRFLOW__METRICS__STATSD_HOST: statsd-exporter
+    AIRFLOW__METRICS__STATSD_PORT: "8125"
+    AIRFLOW__METRICS__STATSD_PREFIX: airflow
+    # Pass through env vars for GE and Slack
+    POSTGRES_HOST: postgres
+    POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+    POSTGRES_DB: ${POSTGRES_DB}
+    POSTGRES_USER: ${POSTGRES_USER}
+    POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL}
+    PYTHONPATH: /opt/airflow
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - ./airflow/logs:/opt/airflow/logs
+    - ./airflow/plugins:/opt/airflow/plugins
+    - ./alerts:/opt/airflow/alerts
+    - ./great_expectations:/opt/airflow/great_expectations
+    - airflow-logs:/opt/airflow/logs
+  depends_on:
+    postgres:
+      condition: service_healthy
+  networks:
+    - dq-net
+  restart: unless-stopped
+
+services:
+
+  # ──────────────────────────── PostgreSQL 15 ─────────────────────────────────
+  postgres:
+    image: postgres:15-alpine
+    container_name: dq-postgres
+    env_file: .env
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - dq-net
+    restart: unless-stopped
+
+  # ─────────────────────────── Airflow init ───────────────────────────────────
+  airflow-init:
+    <<: *airflow-common
+    container_name: dq-airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db upgrade
+        airflow users create \
+          --username admin \
+          --password admin \
+          --firstname Admin \
+          --lastname User \
+          --role Admin \
+          --email admin@example.com || true
+    environment:
+      <<: *airflow-common-env
+    restart: "no"
+
+  # ────────────────────────── Airflow webserver ───────────────────────────────
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: dq-airflow-webserver
+    command: webserver
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ────────────────────────── Airflow scheduler ───────────────────────────────
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: dq-airflow-scheduler
+    command: scheduler
+    healthcheck:
+      test: ["CMD", "airflow", "jobs", "check", "--job-type", "SchedulerJob", "--hostname", "$${HOSTNAME}"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ─────────────────────────── Prometheus ────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.51.2
+    container_name: dq-prometheus
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.console.libraries=/etc/prometheus/console_libraries"
+      - "--web.console.templates=/etc/prometheus/consoles"
+      - "--storage.tsdb.retention.time=30d"
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    networks:
+      - dq-net
+    restart: unless-stopped
+
+  # ──────────────────────── StatsD → Prometheus exporter ──────────────────────
+  statsd-exporter:
+    image: prom/statsd-exporter:v0.26.1
+    container_name: dq-statsd-exporter
+    ports:
+      - "9102:9102"
+      - "8125:8125/udp"
+    networks:
+      - dq-net
+    restart: unless-stopped
+
+  # ─────────────────────── postgres_exporter ──────────────────────────────────
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.15.0
+    container_name: dq-postgres-exporter
+    env_file: .env
+    environment:
+      DATA_SOURCE_NAME: "postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable"
+    ports:
+      - "9187:9187"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - dq-net
+    restart: unless-stopped
+
+  # ────────────────────────────── Grafana ─────────────────────────────────────
+  grafana:
+    image: grafana/grafana:10.4.2
+    container_name: dq-grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    depends_on:
+      - prometheus
+    networks:
+      - dq-net
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  airflow-logs:
+  prometheus-data:
+  grafana-data:
+
+networks:
+  dq-net:
+    driver: bridge
+    name: dq-net
