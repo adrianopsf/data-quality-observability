@@ -122,7 +122,7 @@ jobs:
           # the real apache-airflow package installed in site-packages.
           export PYTHONPATH=$PWD/airflow/dags:$PWD/alerts
           python -c "
-          import importlib, sys, pathlib
+          import importlib.util, sys, pathlib
           dag_dir = pathlib.Path('airflow/dags')
           for dag_file in sorted(dag_dir.glob('*.py')):
               if dag_file.name.startswith('__'):
